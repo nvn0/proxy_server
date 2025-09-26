@@ -1,5 +1,8 @@
 import  strformat, tables, json, strutils, sequtils, hashes, net, asyncdispatch, asyncnet, os, parseutils, deques, options
 
+
+# Funciona mais como um proxy "normal", funciona como proxy para o firefox
+
 # Aqui o * indica que o campo é publico
 type ForwardOptions = object
   listenAddr*: string
