@@ -1,9 +1,5 @@
 import  strformat, tables, json, strutils, sequtils, hashes, net, asyncdispatch, asyncnet, os, parseutils, deques, options
 
-# Works like a router/tcp forwarder
-# Listens on a given address:port and forwards all traffic to another address:port
-
-
 # Aqui o * indica que o campo é publico
 type ForwardOptions = object
   listenAddr*: string
@@ -25,7 +21,7 @@ proc newForwarder(opts: ForwardOptions): ref Forwarder =
 # helper: append to a file (fallback that uses readFile/writeFile so we don't call a missing symbol)
 proc appendFileSafe(path: string, data: string) =
   try:
-    if existsFile(path):
+    if fileExists(path):
       let prev = readFile(path)
       writeFile(path, prev & data)
     else:
@@ -62,17 +58,67 @@ proc copyLoop(src: AsyncSocket, dst: AsyncSocket) {.async.} =
     discard
   # caller is responsible for closing sockets
 
-proc processClient(this: ref Forwarder, client: AsyncSocket) {.async.} =
-  let remote = newAsyncSocket(buffered=false)
-  # try to connect to target
-  try:
-    await remote.connect(this.options.toAddr, this.options.toPort)
-  except OSError as e:
-    echo fmt"Failed to connect to remote {this.options.toAddr}:{this.options.toPort} -- {e.msg}"
-    try: client.close() except: discard
-    return
 
-  # read a first chunk from client to detect request type (non-blocking await)
+# helper: parse host[:port] string, retorna (host, Port)
+proc parseHostPort(s: string, defPort: int): (string, Port) =
+  var host = s.strip()
+  var port = defPort
+  if host.contains(':'):
+    let parts = host.split(':')
+    if parts.len >= 2:
+      host = parts[0].strip()
+      try:
+        let p = parseInt(parts[1].strip())
+        if p > 0: port = p
+      except:
+        discard
+  return (host, Port(port))
+
+
+
+
+# tenta extrair destino real de uma requisição HTTP/CONNECT; devolve (host, port)
+proc extractTargetFromHttp(firstChunk: string, defaultHost: string, defaultPort: int): (string, Port) =
+  let lines = firstChunk.splitLines()
+  if lines.len == 0:
+    return (defaultHost, Port(defaultPort))
+  let reqLine = lines[0]
+  let toks = reqLine.splitWhitespace()
+  if toks.len < 2:
+    return (defaultHost, Port(defaultPort))
+  let verb = toks[0].toUpperAscii()
+  let targetTok = toks[1]
+  # CONNECT host:port
+  if verb == "CONNECT":
+    return parseHostPort(targetTok, defaultPort)
+  # absolute URL in request line: http://host/... or https://host/...
+  var after = targetTok
+  if after.startsWith("http://"):
+    after = after.substr(7)
+  elif after.startsWith("https://"):
+    after = after.substr(8)
+  if after.len > 0 and not (after[0] in [' ', '\t', '\r', '\n']):
+    let hostPart = after.split('/')[0]
+    if hostPart.len > 0:
+      return parseHostPort(hostPart, defaultPort)
+  # fallback: procurar header Host:
+  for i in 1 ..< lines.len:
+    let ln = lines[i]
+    if ln.len > 5 and ln[0..4].toLowerAscii() == "host:":
+      let hv = ln.split(':', 2)[1].strip()
+      if hv.len > 0:
+        return parseHostPort(hv, defaultPort)
+  # fallback geral
+  return (defaultHost, Port(defaultPort))
+
+
+
+# Modificação em processClient: antes de conectar ao remote, tentar extrair destino real se HTTP
+proc processClient(this: ref Forwarder, client: AsyncSocket) {.async.} =
+  var targetHost = this.options.toAddr
+  var targetPort: Port = this.options.toPort
+
+  # ler um primeiro bloco do cliente para detectar tipo e (se for HTTP) destino real
   var firstChunk = ""
   try:
     firstChunk = await client.recv(4096)
@@ -81,47 +127,43 @@ proc processClient(this: ref Forwarder, client: AsyncSocket) {.async.} =
 
   let reqType = detectRequestType(firstChunk)
 
-  # gather peer info if available (best-effort)
-  var clientIp: string = ""
-  var clientPort: string = ""
-  try:
-    clientIp = $client.getPeerAddr()
-    #clientPort = $client.getPeerPort()
-  except:
-    discard
+  if reqType == "http":
+    let (h, p) = extractTargetFromHttp(firstChunk, this.options.toAddr, int(this.options.toPort))
+    targetHost = h
+    targetPort = p
 
-  # emit JSON-line to stdout
+  # agora tentar conectar ao destino determinado
+  let remote = newAsyncSocket(buffered=false)
+  try:
+    await remote.connect(targetHost, targetPort)
+  except OSError as e:
+    echo fmt"Failed to connect to remote {targetHost}:{targetPort} -- {e.msg}"
+    try: client.close() except: discard
+    return
+
+  # logging (regista o destino real)
+  var clientIp = ""
+  try: clientIp = $client.getPeerAddr() except: discard
   let logJson = %*{
     "client_ip": clientIp,
-    "client_port": clientPort,
-    "target": fmt"{this.options.toAddr}:{this.options.toPort}",
+    "target": fmt"{targetHost}:{targetPort}",
     "request_type": reqType
   }
   let line = $logJson
-  echo line # JSON line to stdout
-
-# append JSON-line to logfile if configured
+  echo line
   if this.options.logFile.len > 0:
     try:
       appendFileSafe(this.options.logFile, line & "\n")
     except OSError as e:
-      # falha em gravar não interrompe o proxy, apenas reporta em stdout
       echo fmt"Failed writing log to {this.options.logFile}: {e.msg}"
 
-  # forward first chunk to remote (if any)
+  # encaminhar o primeiro bloco (se tiver) e iniciar cópias bidirecionais
   if firstChunk.len > 0:
-    try:
-      await remote.send(firstChunk)
-    except OSError:
-      try: client.close() except: discard
-      try: remote.close() except: discard
-      return
+    try: await remote.send(firstChunk) except: discard
 
-  # start bidirectional forwarding: spawn one side and await the other
   asyncCheck copyLoop(client, remote)
   await copyLoop(remote, client)
 
-  # close sockets gracefully
   try: client.close() except: discard
   try: remote.close() except: discard
 
@@ -130,8 +172,7 @@ proc serve(this: ref Forwarder) {.async.} =
   var server = newAsyncSocket(buffered=false)
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(this.options.listenPort, this.options.listenAddr)
-  echo fmt"Started tcp server on: {this.options.listenAddr}:{this.options.listenPort} "
-  echo fmt"Forwarding to: {this.options.toAddr}:{this.options.toPort} "
+  echo fmt"Started tcp server... {this.options.listenAddr}:{this.options.listenPort} "
   server.listen()
   
   while true:
