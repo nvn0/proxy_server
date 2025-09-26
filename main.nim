@@ -25,7 +25,7 @@ proc newForwarder(opts: ForwardOptions): ref Forwarder =
 # helper: append to a file (fallback that uses readFile/writeFile so we don't call a missing symbol)
 proc appendFileSafe(path: string, data: string) =
   try:
-    if existsFile(path):
+    if fileExists(path):
       let prev = readFile(path)
       writeFile(path, prev & data)
     else:
@@ -146,7 +146,7 @@ proc serve(this: ref Forwarder) {.async.} =
 
 when isMainModule:
   # parse command line args
-  let opts = ForwardOptions(listenAddr:"127.0.0.1", listenPort:11000.Port, toAddr:"127.0.0.1", toPort:8000.Port)
+  let opts = ForwardOptions(listenAddr:"127.0.0.1", listenPort:11000.Port, toAddr:"127.0.0.1", toPort:8000.Port, logFile: "proxy.log")
   var f = newForwarder(opts)
   asyncCheck f.serve()
   runForever()

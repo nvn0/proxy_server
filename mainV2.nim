@@ -187,7 +187,7 @@ proc serve(this: ref Forwarder) {.async.} =
 
 when isMainModule:
   # parse command line args
-  let opts = ForwardOptions(listenAddr:"127.0.0.1", listenPort:11000.Port, toAddr:"127.0.0.1", toPort:8000.Port)
+  let opts = ForwardOptions(listenAddr:"127.0.0.1", listenPort:11000.Port, toAddr:"127.0.0.1", toPort:8000.Port, logFile: "proxyV2.log")
   var f = newForwarder(opts)
   asyncCheck f.serve()
   runForever()
